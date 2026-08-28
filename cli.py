@@ -134,36 +134,62 @@ def cmd_login(args: argparse.Namespace) -> int:
 
 def cmd_cookies(args: argparse.Namespace) -> int:
     """Where cookies come from and why they fail to decrypt. Prints names and sizes, never values."""
-    from auth import _chromium_dbs, _chromium_keys, _firefox_dbs, _query_sqlite, _clean_cookie_bytes
+    from auth import (
+        IS_MAC,
+        IS_WINDOWS,
+        _chromium_dbs,
+        _clean_cookie_bytes,
+        _firefox_dbs,
+        _macos_keychain_passwords,
+        _posix_chromium_keys,
+        _query_sqlite,
+        _safari_cookie_files,
+        _safari_cookies,
+        _windows_chromium_key,
+    )
 
     envs, _ = _envs(args.env)
     host = envs[0].host
-    print(f"host: {host}\n")
+    platform = "windows" if IS_WINDOWS else "macos" if IS_MAC else "linux"
+    print(f"host: {host}")
+    print(f"platform: {platform}\n")
 
-    try:
-        import secretstorage
+    if IS_MAC:
+        found = _macos_keychain_passwords()
+        print(f"keychain: {len(found)} 'Safe Storage' password(s) readable")
+    elif not IS_WINDOWS:
+        try:
+            import secretstorage
 
-        conn = secretstorage.dbus_init()
-        labels = []
-        for coll in secretstorage.get_all_collections(conn):
-            state = "locked" if coll.is_locked() else "unlocked"
-            labels.append(f"{coll.get_label()} [{state}]")
-            if not coll.is_locked():
-                for item in coll.get_all_items():
-                    if "Safe Storage" in (item.get_label() or ""):
-                        labels.append(f"  found item: {item.get_label()}")
-        print("keyring collections:", labels or "none")
-    except Exception as exc:
-        print(f"keyring unavailable: {type(exc).__name__}: {exc}")
+            conn = secretstorage.dbus_init()
+            labels = []
+            for coll in secretstorage.get_all_collections(conn):
+                state = "locked" if coll.is_locked() else "unlocked"
+                labels.append(f"{coll.get_label()} [{state}]")
+                if not coll.is_locked():
+                    for item in coll.get_all_items():
+                        if "Safe Storage" in (item.get_label() or ""):
+                            labels.append(f"  found item: {item.get_label()}")
+            print("keyring collections:", labels or "none")
+        except Exception as exc:
+            print(f"keyring unavailable: {type(exc).__name__}: {exc}")
 
-    keys = _chromium_keys()
-    print(f"candidate keys: {len(keys)} (keyring first, 'peanuts' last)\n")
+    keys: list[bytes] = []
+    if not IS_WINDOWS:
+        keys = _posix_chromium_keys()
+        hint = "keychain" if IS_MAC else "keyring first, 'peanuts' last"
+        print(f"candidate keys: {len(keys)} ({hint})\n")
 
     for db in _firefox_dbs():
         rows = _query_sqlite(db, "SELECT name, value FROM moz_cookies WHERE host LIKE ?", (f"%{host}%",))
         print(f"firefox {db}: {[name for name, _ in rows] or 'no cookies'}")
 
-    for db in _chromium_dbs():
+    win_keys: dict[str, bytes | None] = {}
+    for root, db in _chromium_dbs():
+        if IS_WINDOWS and root not in win_keys:
+            win_keys[root] = _windows_chromium_key(root)
+            state = "unwrapped" if win_keys[root] else "FAILED (DPAPI)"
+            print(f"chromium {root}: Local State key {state}")
         try:
             rows = _query_sqlite(
                 db,
@@ -176,12 +202,22 @@ def cmd_cookies(args: argparse.Namespace) -> int:
         print(f"chromium {db}: {len(rows)} cookies")
         for name, host_key, plain_len, enc in rows:
             prefix = bytes(enc or b"")[:3]
-            decrypted = _chromium_decrypt_report(enc, keys, _clean_cookie_bytes)
-            print(f"  {name:<20} host={host_key:<28} prefix={prefix!r:<8} plain_len={plain_len} -> {decrypted}")
+            if IS_WINDOWS:
+                report = _windows_decrypt_report(enc, win_keys.get(root), _clean_cookie_bytes)
+            else:
+                report = _posix_decrypt_report(enc, keys, _clean_cookie_bytes)
+            print(f"  {name:<20} host={host_key:<28} prefix={prefix!r:<8} plain_len={plain_len} -> {report}")
+
+    if IS_MAC:
+        files = _safari_cookie_files()
+        print(f"\nsafari files: {files or 'none (or no Full Disk Access)'}")
+        if files:
+            names = sorted(_safari_cookies(host))
+            print(f"safari cookies for host: {names or 'none persisted (session-only cookies live in memory)'}")
     return 0
 
 
-def _chromium_decrypt_report(enc: bytes, keys: list, cleaner) -> str:
+def _posix_decrypt_report(enc: bytes, keys: list, cleaner) -> str:
     """Try every key and report which one produced printable ascii, without exposing the value."""
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -205,6 +241,27 @@ def _chromium_decrypt_report(enc: bytes, keys: list, cleaner) -> str:
         if text:
             return f"OK with key#{index}, len={len(text)}, jwt={text.count('.') == 2}"
     return "no key produced printable ascii"
+
+
+def _windows_decrypt_report(enc: bytes, key: bytes | None, cleaner) -> str:
+    """Same report for the DPAPI path. v20 is App-Bound Encryption, which isn't supported."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    if not enc:
+        return "no encrypted value"
+    if not key:
+        return "no DPAPI key for this browser"
+    prefix, body = bytes(enc)[:3], bytes(enc)[3:]
+    if prefix == b"v20":
+        return "v20 app-bound encryption, not supported"
+    if prefix not in (b"v10", b"v11"):
+        return "unencrypted"
+    try:
+        plain = AESGCM(key).decrypt(body[:12], body[12:], None)
+    except Exception as exc:
+        return f"decrypt error {type(exc).__name__}"
+    text = cleaner(plain)
+    return f"OK, len={len(text)}, jwt={text.count('.') == 2}" if text else "no printable ascii"
 
 
 def cmd_deps(args: argparse.Namespace) -> int:
@@ -368,7 +425,7 @@ def main() -> int:
     load_env()
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
-        "--env", default=argparse.SUPPRESS, help="limit to one environment: prod, stage, test, local"
+        "--env", default=argparse.SUPPRESS, help="limit to one environment defined in instances.json"
     )
 
     parser = argparse.ArgumentParser(description=__doc__, parents=[common])
@@ -400,7 +457,7 @@ def main() -> int:
     p.set_defaults(func=cmd_selftest)
 
     p = sub.add_parser("queue-load", parents=[common], help="how busy a celery queue is")
-    p.add_argument("--queue", default="ingest")
+    p.add_argument("--queue", default="default")
     p.add_argument("--hours", type=int, default=24)
     p.set_defaults(func=cmd_queue_load)
 

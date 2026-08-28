@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["mcp>=1.9.0", "httpx>=0.27", "cryptography>=42", "secretstorage>=3.3"]
 # ///
-"""MCP server for Apache Airflow 3 (REST API v2) across prod, stage, test and local."""
+"""MCP server for Apache Airflow 3 (REST API v2) across every configured instance."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ async def airflow_environments() -> dict:
 async def airflow_status(env: str | None = None) -> dict:
     """Health of one instance: version, components, import errors, DAGs whose last run failed.
 
-    Call this first when something looks wrong. `env` is one of: prod, stage, test, local.
+    Call this first when something looks wrong. Use `airflow_environments` for the valid `env` names.
     """
     client = api(env)
     version = await client.get("/api/v2/version")
