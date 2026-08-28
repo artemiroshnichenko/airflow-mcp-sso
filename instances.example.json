@@ -1,0 +1,17 @@
+{
+  "default": "prod",
+  "environments": {
+    "prod": {
+      "urls": ["https://airflow.example.com"],
+      "auth": ["browser"]
+    },
+    "stage": {
+      "urls": ["https://airflow-stage.example.com"],
+      "auth": ["browser"]
+    },
+    "local": {
+      "urls": ["http://localhost:8080"],
+      "auth": ["password", "browser"]
+    }
+  }
+}
